@@ -77,25 +77,22 @@ public class QryEval {
     String modelString = parameters.get ("retrievalAlgorithm").toLowerCase();
 
     if (modelString.equals("unrankedboolean")) {
-
       model = new RetrievalModelUnrankedBoolean();
-
-      //  If this retrieval model had parameters, they would be
-      //  initialized here.
 
     } else if (modelString.equals("rankedboolean")) {
 
       model = new RetrievalModelRankedBoolean();
 
-      //  If this retrieval model had parameters, they would be
-      //  initialized here.
-
+    } else if (modelString.equals("indri")) {
+      model = new RetrievalModelIndri(Integer.parseInt(parameters.get("Indri:mu")), 
+                                      Double.parseDouble(parameters.get("Indri:lambda")));
+    } else if (modelString.equals("bm25")) {
+      model = new RetrievalModelBM25(Double.parseDouble(parameters.get("BM25:k_1")),
+                                     Double.parseDouble(parameters.get("BM25:b")),
+                                     Double.parseDouble(parameters.get("BM25:k_3")));
     }
 
-    //  STUDENTS::  Add new retrieval models here.
-
     else {
-
       throw new IllegalArgumentException
         ("Unknown retrieval model " + parameters.get("retrievalAlgorithm"));
     }
@@ -263,7 +260,7 @@ public class QryEval {
     */
     // System.out.println("Score list size: " + result.size());
     try {
-      FileWriter myWriter = new FileWriter(trecEvalOutputPath, true );
+      FileWriter myWriter = new FileWriter(trecEvalOutputPath, true);
       if (result.size() == 0) {
         // System.out.println(queryName + " Q0 dummy 1 0 ?");
         myWriter.write(queryName + " Q0 dummyRecord 1 0 ?\n");

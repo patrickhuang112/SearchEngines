@@ -30,6 +30,9 @@ public abstract class QrySop extends Qry {
   public abstract double getScore (RetrievalModel r)
     throws IOException;
 
+  public abstract double getDefaultScore (RetrievalModel r, long docid)
+    throws IOException;
+
   /**
    *  Initialize the query operator (and its arguments), including any
    *  internal iterators.  If the query operator is of type QryIop, it

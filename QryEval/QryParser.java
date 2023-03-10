@@ -89,6 +89,15 @@ public class QryParser {
     //  Create the query operator.
     
     switch (substrings[0]) {
+      case "#sum":
+        operator = new QrySopSum ();
+        break;
+      case "#wand":
+        operator = new QrySopWAnd ();
+        break;
+      case "#wsum":
+        operator = new QrySopWSum ();
+        break;
       case "#or":
         operator = new QrySopOr ();
         break;
@@ -103,6 +112,12 @@ public class QryParser {
           syntaxError("Didn't get how much to be near by"); 
         }
         operator = new QryIopNear (Integer.parseInt(substrings[1]));
+        break;
+      case "#window":
+        if (substrings.length != 2) {
+          syntaxError("Didn't get how much to be near by"); 
+        }
+        operator = new QryIopWindow (Integer.parseInt(substrings[1]));
         break;
       //  STUDENTS:: 
       //  Add new query operators here.
@@ -256,7 +271,6 @@ public class QryParser {
 
   }
 
-
   /**
    *  Parse a query string into a query tree.
    *  @param queryString The query string, in an Indri-style query
@@ -295,14 +309,13 @@ public class QryParser {
     queryString = substrings[1];
     queryString =
       queryString.substring (0, queryString.lastIndexOf(")")).trim();
-    
+      
     //  Each pass below handles one argument to the query operator.
     //  Note: An argument can be a token that produces multiple terms
     //  (e.g., "near-death") or a subquery (e.g., "#and (a b c)").
     //  Recurse on subqueries.
-
+    Double weight = null; 
     while (queryString.length() > 0) {
-      // System.out.println("Query string loopSTART: " + queryString);
       //  STUDENTS:: (HW2)
       //  If the operator uses weighted query arguments (e.g., #WAND),
       //  each pass of this loop must handle "weight arg".  Handle the
@@ -312,24 +325,35 @@ public class QryParser {
 
       Qry[] qargs = null;
       PopData<String,String> p;
-
+      boolean isWeight = false;
       if (queryString.charAt(0) == '#') {	// Subquery
         p = popSubquery (queryString);
         qargs = new Qry[1];
         qargs[0] = parseString (p.getPopped());
       } else {					// Term
-        // System.out.println("Loop, popping terms");
         p = popTerm (queryString);
-        qargs = createTerms (p.getPopped());
+        try {
+          weight = Double.parseDouble(p.getPopped()); 
+          isWeight = true;
+        } catch (NumberFormatException e) {
+          isWeight = false; 
+          qargs = createTerms (p.getPopped());
+        }
       }
 
       queryString = p.getRemaining().trim();	// Consume the arg
       // System.out.println("Query string loopEND: " + queryString);
       //  Add the argument(s) to the query tree.
-
-      for (int i=0; i<qargs.length; i++) {
-        //  STUDENTS WILL NEED TO ADJUST THIS BLOCK TO HANDLE WEIGHTS IN HW2
-        queryTree.appendArg (qargs[i]);
+      if (!isWeight) {
+        for (int i=0; i<qargs.length; i++) {
+          //  STUDENTS WILL NEED TO ADJUST THIS BLOCK TO HANDLE WEIGHTS IN HW2
+          if (queryTree instanceof QrySopWeighted) {
+            QrySopWeighted weighted = (QrySopWeighted)queryTree;  
+            assert(weight != null);
+            weighted.appendWeight(weight);
+          }
+          queryTree.appendArg (qargs[i]);
+        }
       }
     }
     return queryTree;

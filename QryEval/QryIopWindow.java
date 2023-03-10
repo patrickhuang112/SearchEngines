@@ -7,13 +7,11 @@ import java.util.*;
 /**
  *  The SYN operator for all retrieval models.
  */
-public class QryIopNear extends QryIop {
-
-  
+public class QryIopWindow extends QryIop {
 
   private int distance;
 
-  public QryIopNear(int distance) {
+  public QryIopWindow(int distance) {
     this.distance = distance;
   }
 
@@ -57,56 +55,61 @@ public class QryIopNear extends QryIop {
     } 
   }
 
-  private boolean alignAllLocationIterators (ArrayList<InvList.DocPosting> docPostings, 
-                                             ArrayList<Integer> locationIterators) {
-    // Assumes all are already at this docid;
-    // System.out.println("Sizes: " + locationIterators.size() + ", " + docPostings.size());
-    if (locationIterators.get(0) >= docPostings.get(0).positions.size())  {
-      return false;
-    }
-
-    int left_location = docPostings.get(0).positions.get(locationIterators.get(0));
-    for (int i = 1; i < this.args.size(); i++) {
-      int locationIt = locationIterators.get(i);
-      Vector<Integer> positions = docPostings.get(i).positions;
-      while (true) {
-        if (locationIt >= positions.size()) {
-          break; 
-        }
-        int location = positions.get(locationIt);
-        if (location > left_location) {
-          left_location = location;
-          break; 
-        }
-        locationIt++;
-      }
-      if (locationIt >= positions.size()) {
-        return false; 
-      }
-      locationIterators.set(i, locationIt);
-    }
-    return true;
-  }
-
   private void incrementAllLocationIterators (ArrayList<Integer> locationIterators) {
     for (int i = 0; i < locationIterators.size(); i++) {
       locationIterators.set(i, locationIterators.get(i) + 1); 
     }
   }
 
-  // Returns -1 if not correct, otherwise the right most location iterator
-  private int checkAllLocationIterators (ArrayList<InvList.DocPosting> docPostings,
-                                          ArrayList<Integer> locationIterators) {
-    int left_location = docPostings.get(0).positions.get(locationIterators.get(0));
-    for (int i = 1; i < docPostings.size(); i++) {
-      int cur_location = docPostings.get(i).positions.get(locationIterators.get(i));
-      if (cur_location - left_location > distance) {
-        return -1; 
-      }
-      left_location = cur_location;
+  private void incrementMinLocationIterators (ArrayList<Integer> minIterators,
+                                              ArrayList<Integer> locationIterators) {
+    for (Integer i : minIterators) {
+      locationIterators.set(i, locationIterators.get(i) + 1); 
     }
-    // Final left_location is location of right most doc
-    return left_location;
+  }
+
+  private ArrayList<Integer> findMinLocations(ArrayList<InvList.DocPosting> docPostings,
+                              ArrayList<Integer> locationIterators) {
+    int smallest = Integer.MAX_VALUE;
+    ArrayList<Integer> smallest_indexes = new ArrayList<>();
+    for (int i = 0; i < locationIterators.size(); i++) {
+      int location = docPostings.get(i).positions.get(locationIterators.get(i));
+      if (location < smallest) {
+        smallest = location;
+        smallest_indexes.clear();
+        smallest_indexes.add(i);
+      } else if (location == smallest) {
+        smallest_indexes.add(i);
+      } 
+    }
+    return smallest_indexes;
+  }
+  
+  private ArrayList<Integer> findMaxLocations(ArrayList<InvList.DocPosting> docPostings,
+                              ArrayList<Integer> locationIterators) {
+    int largest = -1;
+    ArrayList<Integer> largest_indexes = new ArrayList<>();
+    for (int i = 0; i < locationIterators.size(); i++) {
+      int location = docPostings.get(i).positions.get(locationIterators.get(i));
+      if (location > largest) {
+        largest = location;
+        largest_indexes.clear();
+        largest_indexes.add(i);
+      } else if (location == largest) {
+        largest_indexes.add(i);
+      } 
+    }
+    return largest_indexes;
+  }
+
+  private boolean checkLocationIterators (ArrayList<InvList.DocPosting> docPostings, 
+                                          ArrayList<Integer> locationIterators) {
+    for (int i = 0; i < this.args.size(); i++) {
+      if (locationIterators.get(i) >= docPostings.get(i).positions.size()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -123,7 +126,6 @@ public class QryIopNear extends QryIop {
     ArrayList<Integer> docIterators = new ArrayList<>();
     for (Qry q_i: this.args) {
       QryIop q_iop = (QryIop)q_i;
-
       // If any of the terms doesn't even have a match, we already have an
       // empty inv list
       if (!q_iop.docIteratorHasMatch(null)){
@@ -140,33 +142,31 @@ public class QryIopNear extends QryIop {
       if (docid == -1) {
         return; 
       }
-      // 396922 
       docPostings.clear();  
       ArrayList<Integer> locationIterators = new ArrayList<>(); 
       for (Qry q_i : this.args) {
         QryIop q_iop = (QryIop)q_i;
         InvList.DocPosting posting = q_iop.docIteratorGetMatchPosting();
-        if (docid == 396922) {
-          System.out.println("Posting docid: " + posting.docid + ", and size: " + posting.positions.size()); 
-        }
-        // System.out.println("Posting docid: " + posting.docid + ", and size: " + posting.positions.size());
         docPostings.add(posting);
         locationIterators.add(0);
       }
 
       ArrayList<Integer> matchingLocations = new ArrayList<>();  
-      while (alignAllLocationIterators(docPostings, locationIterators)) {
-        int rightmost_location = checkAllLocationIterators(docPostings, locationIterators);
-        if (rightmost_location != -1) {
+      while (checkLocationIterators(docPostings, locationIterators)) {
+        ArrayList<Integer> mins = findMinLocations(docPostings, locationIterators); 
+        ArrayList<Integer> maxs = findMaxLocations(docPostings, locationIterators); 
+        assert(!mins.isEmpty() && !maxs.isEmpty());
+        int min_location = docPostings.get(mins.get(0)).positions.get(locationIterators.get(mins.get(0)));
+        int max_location = docPostings.get(maxs.get(0)).positions.get(locationIterators.get(maxs.get(0)));
+        if (max_location - min_location < distance) {
+          matchingLocations.add(max_location);
           incrementAllLocationIterators(locationIterators);
-          matchingLocations.add(rightmost_location);
         } else {
-          // Increment leftmost
-          locationIterators.set(0, locationIterators.get(0) + 1); 
+          incrementMinLocationIterators(mins, locationIterators);
         }
       }
+      
       if (!matchingLocations.isEmpty()) {
-        // System.out.println("Docid: " + docid + ", extern: " + Idx.getExternalDocid(docid));
         invertedList.appendPosting(docid, matchingLocations);
       }
       // Finish with this doc
@@ -174,7 +174,6 @@ public class QryIopNear extends QryIop {
         QryIop q_iop = (QryIop)q_i;
         q_iop.docIteratorAdvancePast(docid);
       }
-       
     }
   }
 
