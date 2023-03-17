@@ -10,11 +10,19 @@
 public class RetrievalModelIndri extends RetrievalModel {
   public int mu; 
   public double lambda;
+  public double origWeight;
 
   public RetrievalModelIndri(int mu, double lambda) {
     System.out.println("Mu: " + mu + ", lambda: " + lambda);
     this.mu = mu; 
     this.lambda = lambda;
+  }
+
+  public RetrievalModelIndri(int mu, double lambda, double origWeight) {
+    System.out.println("Mu: " + mu + ", lambda: " + lambda);
+    this.mu = mu; 
+    this.lambda = lambda;
+    this.origWeight = origWeight;
   }
 
   public String defaultQrySopName () {

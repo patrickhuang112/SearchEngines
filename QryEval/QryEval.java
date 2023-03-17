@@ -6,6 +6,7 @@
  */
 import java.io.*;
 import java.util.*;
+import java.nio.charset.*;
 
 /**
  *  This software illustrates the architecture for the portion of a
@@ -21,7 +22,14 @@ public class QryEval {
 
   private static final String USAGE =
     "Usage:  java QryEval paramFile\n\n";
+  
+  private static CharsetEncoder asciiEncoder = 
+    Charset.forName("US-ASCII").newEncoder();
 
+  public static boolean isAsciiString (String s) {
+    return asciiEncoder.canEncode(s);
+  }
+  
   //  --------------- Methods ---------------------------------------
 
   /**
@@ -54,9 +62,7 @@ public class QryEval {
     RetrievalModel model = initializeRetrievalModel (parameters);
 
     //  Perform experiments.
-    processQueryFile(parameters.get("queryFilePath"), 
-                     parameters.get("trecEvalOutputPath"),
-                     parameters.get("trecEvalOutputLength"), model);
+    processQueryFile(parameters, model);
 
     //  Clean up.
     
@@ -100,6 +106,32 @@ public class QryEval {
     return model;
   }
 
+  private static RetrievalModel initializePrfRetrievalModel (Map<String, String> parameters)
+    throws IOException {
+
+    RetrievalModel model = null;
+    String modelString = parameters.get ("prf").toLowerCase();
+    assert(modelString != "false");
+    assert(modelString == "indri" || modelString == "bm25");
+    if (modelString.equals("indri")) {
+      model = new RetrievalModelIndri(Integer.parseInt(parameters.get("prf:Indri:mu")), 
+                                      0.0, 
+                                      Double.parseDouble(parameters.get("prf:Indri:origWeight")));
+      
+    } else if (modelString.equals("bm25")) {
+      model = new RetrievalModelBM25(Double.parseDouble(parameters.get("prf:BM25:k_1")),
+                                     Double.parseDouble(parameters.get("prf:BM25:b")),
+                                     Double.parseDouble(parameters.get("prf:BM25:k_3")));
+    }
+
+    else {
+      throw new IllegalArgumentException
+        ("Unknown retrieval model " + parameters.get("retrievalAlgorithm"));
+    }
+      
+    return model;
+  }
+
   /**
    * Print a message indicating the amount of memory used. The caller can
    * indicate whether garbage collection should be performed, which slows the
@@ -117,6 +149,11 @@ public class QryEval {
 
     System.out.println("Memory used:  "
         + ((runtime.totalMemory() - runtime.freeMemory()) / (1024L * 1024L)) + " MB");
+  }
+
+  static String getOriginalQueryString(String qString, RetrievalModel model) {
+    String defaultOp = model.defaultQrySopName (); 
+    return defaultOp + "(" + qString + ")";
   }
 
   /**
@@ -154,33 +191,134 @@ public class QryEval {
           q.docIteratorAdvancePast (docid);
         }
       }
-      /* 
-      System.out.println("Before: ");
-      for (int i = 0; i < results.size(); i++) {
-        int rank = i + 1;
-        String toPrint = Idx.getExternalDocid(results.getDocid(i)) + " " 
-                            + Integer.toString(rank) + " " + results.getDocidScore(i) + " ?\n";
-        System.out.println(toPrint);
-      }
-      */
-      // if (model instanceof RetrievalModelRankedBoolean) {
+      
       results.sort(); 
-      // }
-      // System.out.println("Truncating to: " + Integer.parseInt(trecEvalOutputLength));
-      /* 
-      System.out.println("After: ");
-      for (int i = 0; i < results.size(); i++) {
-        int rank = i + 1;
-        String toPrint = Idx.getExternalDocid(results.getDocid(i)) + " " 
-                            + Integer.toString(rank) + " " + results.getDocidScore(i) + " ?\n";
-        System.out.println(toPrint);
-      }
-      */
       results.truncate(Integer.parseInt(trecEvalOutputLength));
       return results;
     } else
       return null;
   }
+
+  static String getLearnedQuery(ExpansionTermList topTerms) {
+    StringBuilder query = new StringBuilder();
+    query.append("#WAND ("); 
+    for (int i = topTerms.size() - 1; i >= 0; --i) {
+      String term = topTerms.getTerm(i); 
+      double score = topTerms.getScore(i);
+      query.append(score);
+      query.append(" ");
+      query.append(term);
+      query.append(" ");
+    }
+    query.append(")"); 
+    return query.toString();
+  }
+
+  static String getExpandedQuery(String originalQuery, String learnedQuery, double weight) {
+    StringBuilder query = new StringBuilder();
+    query.append("#WAND ("); 
+    query.append(weight);
+    query.append(" ");
+    query.append(originalQuery);
+    query.append(" ");
+    query.append(1.0 - weight);
+    query.append(" ");
+    query.append(learnedQuery);
+    query.append(" )"); 
+    return query.toString();
+  }
+
+
+  static ExpansionTermList getExpansionTermIndri(ScoreList topDocs,
+                                                 Map<String, String> parameters) {
+    String field = "";
+    if (parameters.containsKey("prf:expansionField")) {
+      field = parameters.get("prf:expansionField");
+    } else {
+      field = "body"; 
+    }
+
+    ExpansionTermList terms = new ExpansionTermList();
+    Double mu = Double.parseDouble(parameters.get("prf:Indri:mu"));
+    HashMap<String, Double> seenTerms = new HashMap<String, Double>();
+    Double sumOfPrevDocs = 0.0;
+    double fieldlen = 0.0;
+    try {
+      fieldlen = ((double)Idx.getSumOfFieldLengths(field));
+    } catch (IOException ex) {
+      ex.printStackTrace();
+      return terms;
+    }
+
+    int limit = Math.min(topDocs.size(), Integer.parseInt(parameters.get("prf:numDocs")));
+
+    for (int i = 0; i < limit; ++i) {
+      
+      int docId = topDocs.getDocid(i); 
+      double score = topDocs.getDocidScore(i);
+      // System.out.println("DOCID: " + docId);
+      // System.out.println("SCORE: " + score);
+      try {
+        TermVector tv = new TermVector(docId, field);
+        double doclen = (double)tv.positionsLength();
+
+        HashSet<String> unseenTerms = new HashSet<>(seenTerms.keySet());
+        if (doclen == 0.0 && mu == 0.0) {
+          continue; 
+        }
+        for (int j = 0; j < tv.stemsLength(); j++) {
+          String term = tv.stemString(j); 
+          if (term == null || term.contains(".") || term.contains(",") || !isAsciiString(term)) {
+            continue; 
+          }
+          unseenTerms.remove(term);
+
+          double termTf = (double)tv.stemFreq(j);
+          double ctf = (double)(tv.totalStemFreq(j));
+          double idf = Math.log(fieldlen / ctf);
+          double ptc = ctf / fieldlen;
+          
+
+          double prevScore = 0.0;
+          if (seenTerms.containsKey(term)) {
+            prevScore = seenTerms.get(term); 
+          } else {
+            prevScore = ptc * sumOfPrevDocs * idf;
+          }
+
+          double ptd = (termTf + mu * ptc) / (doclen + mu);
+          double thisScore = score * idf * ptd;
+          double newScore = prevScore + thisScore; 
+          seenTerms.put(term, newScore);
+        }
+
+        for (String term : unseenTerms) {
+          double ctf = (double)(Idx.getTotalTermFreq(field, term));
+          double idf = Math.log(fieldlen / ctf);
+          double ptc = ctf / fieldlen;
+
+          // We know termtf is 0 here
+          double prevScore = seenTerms.get(term);
+          double thisScore = score * ((mu * ptc) / (doclen + mu)) * idf;
+          double newScore = prevScore + thisScore;
+          seenTerms.put(term, newScore);
+        }
+
+        sumOfPrevDocs += ((mu * score) / (doclen + mu));
+      } catch (IOException ex) {
+        ex.printStackTrace(); 
+      }
+    }
+
+    for (Map.Entry<String, Double> entry : seenTerms.entrySet()) {
+      terms.add(entry.getKey(), entry.getValue());
+    }
+
+    terms.sort();
+    terms.truncate(Integer.parseInt(parameters.get("prf:numTerms")));
+    return terms;
+  }
+
 
   /**
    *  Process the query file.
@@ -188,13 +326,58 @@ public class QryEval {
    *  @param model A retrieval model that will guide matching and scoring
    *  @throws IOException Error accessing the Lucene index.
    */
-  static void processQueryFile(String queryFilePath,
-                               String trecEvalOutputPath,
-                               String trecEvalOutputLength,
+  static void processQueryFile(Map<String, String> parameters,
                                RetrievalModel model)
       throws IOException {
 
+    String queryFilePath = parameters.get("queryFilePath"); 
+    String trecEvalOutputPath = parameters.get("trecEvalOutputPath");
+    String trecEvalOutputLength = parameters.get("trecEvalOutputLength");
+
+
     BufferedReader input = null;
+    
+    ArrayList<ScoreList> scoreLists = new ArrayList<>();
+    ArrayList<String> queryIds = new ArrayList<>();
+    ScoreList currentScoreList = new ScoreList();
+    String currentQueryId = null;
+
+    if (parameters.containsKey("prf:initialRankingFile")) {
+      String initialRankingFilePath = parameters.get("prf:initialRankingFile");
+      BufferedReader initialRanking = null;
+
+      String rankingLine = null;
+      try {
+        initialRanking = new BufferedReader(new FileReader(initialRankingFilePath)); 
+        while ((rankingLine = initialRanking.readLine()) != null) {
+          String[] pair = rankingLine.split (" "); 
+          // Should be 6 elements
+          String queryId = pair[0]; 
+          int docId = Idx.getInternalDocid(pair[2]);
+          double score = Double.parseDouble(pair[4]);
+          if (currentQueryId == null) {
+            currentQueryId = queryId;
+            queryIds.add(queryId);
+          } else if (!currentQueryId.equals(queryId)) {
+            scoreLists.add(currentScoreList);
+            currentScoreList = new ScoreList();
+            currentQueryId = queryId;
+            queryIds.add(queryId);
+          }
+          currentScoreList.add(docId, score); 
+        }
+
+        if (currentScoreList.size() > 0) {
+          scoreLists.add(currentScoreList); 
+        }
+
+
+      } catch (Exception ex) {
+        ex.printStackTrace();
+      } finally {
+        initialRanking.close();
+      }
+    }
 
     try {
       String qLine = null;
@@ -202,25 +385,49 @@ public class QryEval {
       input = new BufferedReader(new FileReader(queryFilePath));
 
       //  Each pass of the loop processes one query.
-
+      int queryIndex = 0;
       while ((qLine = input.readLine()) != null) {
-
         printMemoryUsage(false);
-        // System.out.println("Query " + qLine);
+        ScoreList results = null;
+        String qid;
         String[] pair = qLine.split(":");
-
         if (pair.length != 2) {
                 throw new IllegalArgumentException
                   ("Syntax error:  Each line must contain one ':'.");
         }
-
-        String qid = pair[0];
         String query = pair[1];
-        ScoreList results = processQuery(query, trecEvalOutputLength, model);
         
-        if (results != null) {
-          printResults(qid, results, trecEvalOutputPath);
+        if (parameters.containsKey("prf:initialRankingFile")) {
+          qid = queryIds.get(queryIndex); 
+          results = scoreLists.get(queryIndex);
+          results.truncate(Integer.parseInt(parameters.get("prf:numDocs")));
+          
+        } else {
+          qid = pair[0];
+          results = processQuery(query, trecEvalOutputLength, model);
         }
+        
+        if (results != null && (!parameters.containsKey("prf") || 
+                                 parameters.get("prf") == "false")) {
+          printResults(qid, results, trecEvalOutputPath);
+        } else {
+          ExpansionTermList prfQuery = getExpansionTermIndri(results, parameters);
+          
+          String originalQuery = getOriginalQueryString(query, model); 
+          String learnedQuery = getLearnedQuery(prfQuery);
+          String expandedQuery = getExpandedQuery(originalQuery, learnedQuery,
+                                                  Double.parseDouble(parameters.get("prf:Indri:origWeight")));
+
+          if (parameters.containsKey("prf:expansionQueryFile")) {
+            System.out.println("LERANRED: " + learnedQuery);
+            System.out.println("EXPAND: " + expandedQuery);
+            printExpandedQuery(qid, learnedQuery, parameters.get("prf:expansionQueryFile"));
+          }
+          ScoreList expandedResults = processQuery(expandedQuery, trecEvalOutputLength, model); 
+          printResults(qid, expandedResults, trecEvalOutputPath); 
+        }
+
+        queryIndex++;
       }
     } catch (IOException ex) {
       ex.printStackTrace();
@@ -247,18 +454,7 @@ public class QryEval {
   static void printResults(String queryName, 
                            ScoreList result,
                            String trecEvalOutputPath) throws IOException {
-    /* 
-    System.out.println(queryName + ":  ");
-    if (result.size() < 1) {
-      System.out.println("\tNo results.");
-    } else {
-      for (int i = 0; i < result.size(); i++) {
-        System.out.println("\t" + i + ":  " + Idx.getExternalDocid(result.getDocid(i)) + ", "
-            + result.getDocidScore(i));
-      }
-    }
-    */
-    // System.out.println("Score list size: " + result.size());
+
     try {
       FileWriter myWriter = new FileWriter(trecEvalOutputPath, true);
       if (result.size() == 0) {
@@ -270,6 +466,45 @@ public class QryEval {
           int rank = i + 1;
           String toPrint = queryName + " Q0 " + Idx.getExternalDocid(result.getDocid(i)) + " " 
                               + Integer.toString(rank) + " " + result.getDocidScore(i) + " ?\n";
+          // System.out.println(toPrint);
+          myWriter.write(toPrint);
+        }
+      }
+      myWriter.close();
+      System.out.println("Successfully wrote to the file.");
+    } catch (IOException e) {
+      System.out.println("Output path invalid");
+      e.printStackTrace();
+    } 
+  }
+
+  static void printExpandedQuery(String originalQueryId, 
+                                 String expandedQuery,
+                                 String expansionQueryFilePath) throws IOException {
+    try {
+      FileWriter myWriter = new FileWriter(expansionQueryFilePath, true);
+      myWriter.write(expandedQuery + "\n");
+      myWriter.close();
+      System.out.println("Successfully wrote to the file.");
+    } catch (IOException e) {
+      System.out.println("Output path invalid");
+      e.printStackTrace();
+    } 
+  }
+
+  static void printExpansionList(String originalQueryId, 
+                                 ExpansionTermList expandedQuery,
+                                 String expansionQueryFilePath) throws IOException {
+    try {
+      FileWriter myWriter = new FileWriter(expansionQueryFilePath, true);
+      if (expandedQuery.size() == 0) {
+        // System.out.println(queryName + " Q0 dummy 1 0 ?");
+        System.out.println("NO EXPANSION TERMS? ");
+        assert(false);
+      } else {
+        System.out.println("YES EXPANSION TERMS ");
+        for (int i = 0; i < expandedQuery.size(); i++) {
+          String toPrint = "Score: " + expandedQuery.getScore(i) + ", term: " + expandedQuery.getTerm(i) + "\n";
           // System.out.println(toPrint);
           myWriter.write(toPrint);
         }
