@@ -483,7 +483,7 @@ public class QryEval {
                                  String expansionQueryFilePath) throws IOException {
     try {
       FileWriter myWriter = new FileWriter(expansionQueryFilePath, true);
-      myWriter.write(expandedQuery + "\n");
+      myWriter.write(originalQueryId + ": " + expandedQuery + "\n");
       myWriter.close();
       System.out.println("Successfully wrote to the file.");
     } catch (IOException e) {
