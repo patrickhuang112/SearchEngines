@@ -144,6 +144,10 @@ public class QryEval {
       
     } while (scan.hasNext()); 
 
+    if (!fvflList.isEmpty()) {
+      queryToDocs.put(currentQueryId, fvflList);
+    }
+
     return queryToDocs;
   }
 
@@ -201,20 +205,20 @@ public class QryEval {
       if (stem == null) {
         continue;
       }
-      String combined = stem + "." + field;
-      double ctf = 0.0;
-      if (ctfs.containsKey(combined)) {
-        ctf = ctfs.get(combined);
-      } else {
-        ctf = (double)Idx.getTotalTermFreq(field, stem);
-        ctfs.put(combined, ctf);
-      }
-      
-      double tf = (double)tv.stemFreq(i);
-      double df = Idx.getDocFreq(field, stem); 
-
       
       if (queryTokens.contains(stem)) {
+        String combined = stem + "." + field;
+        double ctf = 0.0;
+        if (ctfs.containsKey(combined)) {
+          ctf = ctfs.get(combined);
+        } else {
+          ctf = (double)Idx.getTotalTermFreq(field, stem);
+          ctfs.put(combined, ctf);
+        }
+        
+        double tf = (double)tv.stemFreq(i);
+        double df = Idx.getDocFreq(field, stem); 
+
         scoreBM25 += scoreBM25(bm25, tf, df, doc_len, avg_doc_len, num_docs);
         scoreIndri *= scoreIndri(indri, tf, ctf, doc_len, total_field_len, num_docs);
         count += 1;
@@ -328,6 +332,9 @@ public class QryEval {
         }
       } else {
         fvfls = mappings.get(queryId);
+        if (fvfls == null) {
+          System.out.println("QUERY ID:" + queryId);
+        }
       }
       
       for (FeatureVectorFileLine fvfl : fvfls) {
@@ -434,6 +441,10 @@ public class QryEval {
         // myWriter.write(fvfl.toString(isSVMRank, disabledFeatures));
     } while (scan.hasNext()); 
 
+    if (currentScoreList.size() != 0) {
+      printResults(currentQueryId, currentScoreList, outputPath); 
+    }
+    
     myWriter.close();
     scan.close();                    
   }
