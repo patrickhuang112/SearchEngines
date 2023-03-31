@@ -55,7 +55,7 @@
      //  Fetch the term vector, if one exists.
  
      this.luceneTerms = Idx.INDEXREADER.getTermVector(docId, fieldName);
- 
+    
      //  If Lucene doesn't have a term vector, our TermVector is empty.
      
      if (this.luceneTerms == ((Terms) null)) {

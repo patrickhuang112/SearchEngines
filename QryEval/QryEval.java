@@ -7,6 +7,7 @@
 import java.io.*;
 import java.util.*;
 import java.nio.charset.*;
+import ciir.umass.edu.eval.Evaluator;
 
 /**
  *  This software illustrates the architecture for the portion of a
@@ -16,6 +17,9 @@ import java.nio.charset.*;
  *  easily extended to other retrieval models.  For more information,
  *  see the ReadMe.txt file.
  */
+
+
+
 public class QryEval {
 
   //  --------------- Constants and variables ---------------------
@@ -31,6 +35,8 @@ public class QryEval {
   }
   
   //  --------------- Methods ---------------------------------------
+
+  public static int LAST_FEATURE = 21;
 
   /**
    *  @param args The only argument is the parameter file name.
@@ -55,20 +61,499 @@ public class QryEval {
     }
 
     Map<String, String> parameters = readParameterFile (args[0]);
+    
 
     //  Open the index and initialize the retrieval model.
 
     Idx.open (parameters.get ("indexPath"));
-    RetrievalModel model = initializeRetrievalModel (parameters);
 
-    //  Perform experiments.
-    processQueryFile(parameters, model);
+    
+    
+
+    if (parameters.containsKey("retrievalAlgorithm") && 
+        parameters.get("retrievalAlgorithm").equals("ltr")) {
+      performLearningToRank(parameters);
+
+    } else {
+      //  Perform experiments.
+      RetrievalModel model = initializeRetrievalModel (parameters);
+      processQueryFile(parameters, model);      
+    }
+    
 
     //  Clean up.
     
     timer.stop ();
     System.out.println ("Time:  " + timer);
   }
+
+
+  private static Set<Integer> findFeaturesToDisable (Map<String, String> parameters) throws NumberFormatException {
+    if (!parameters.containsKey("ltr:featureDisable")) {
+      return new HashSet<Integer>();
+    }
+    String toIgnore = parameters.get("ltr:featureDisable");
+    ArrayList<Integer> ignoredFeatures = new ArrayList<>(); 
+    String[] each = toIgnore.split(","); 
+    for (String s : each) {
+      ignoredFeatures.add(Integer.parseInt(s)); 
+    }
+    return new HashSet<Integer>(ignoredFeatures);
+  }
+
+  static Map<String, ArrayList<FeatureVectorFileLine>> initializeFeatureVectors(String relevancePath) throws Exception {
+    Map<String, ArrayList<FeatureVectorFileLine>> queryToDocs = new HashMap<String, ArrayList<FeatureVectorFileLine>>();
+    
+    File parameterFile = new File (relevancePath);
+
+    if (! parameterFile.canRead ()) {
+      throw new IllegalArgumentException
+        ("Can't read " + relevancePath);
+    }
+
+    Scanner scan = new Scanner(parameterFile);
+    
+    ArrayList<FeatureVectorFileLine> fvflList = new ArrayList<>();
+    
+    String line = null;
+    String currentQueryId = null;
+    
+    do {
+      line = scan.nextLine();
+      String[] items = line.split (" ");
+      String queryId = items[0];
+      String externalDocid = items[2];
+      int docid = Idx.getInternalDocid(externalDocid);
+      int relevanceScore = Integer.parseInt(items[3]);
+      
+      if (relevanceScore == -2) {
+        relevanceScore = 0; 
+      }
+      
+      if (currentQueryId == null) {
+        currentQueryId = queryId;
+      } else if (!currentQueryId.equals(queryId)) {
+        queryToDocs.put(currentQueryId, fvflList);
+        fvflList = new ArrayList<FeatureVectorFileLine>();
+        currentQueryId = queryId;
+      } 
+      
+      // Calculate feature vector
+      FeatureVector fv = new FeatureVector();
+      fvflList.add(new FeatureVectorFileLine(relevanceScore, docid, externalDocid, queryId, fv));
+      
+    } while (scan.hasNext()); 
+
+    return queryToDocs;
+  }
+
+  private static class ScoreAndCount {
+    public Double scoreBM25; 
+    public Double scoreIndri; 
+    public Double count;
+
+    public ScoreAndCount(Double scoreBM25, Double scoreIndri, Double count) {
+      this.scoreBM25 = scoreBM25; 
+      this.scoreIndri = scoreIndri;
+      this.count = count;
+    }
+  } 
+
+
+  static Double scoreBM25 (RetrievalModelBM25 rm, double tf, double df, double doc_len, double avg_doc_len, double num_docs) {
+    double p1 = Math.max(0.0, Math.log(((num_docs - df + 0.5) / (df + 0.5))));
+    double p2 = tf / (tf + rm.k_1 * ((1.0 - rm.b) + rm.b * (doc_len / avg_doc_len)));
+    double p3 = (rm.k_3 + 1.0) / (rm.k_3 + 1.0);
+    return p1*p2*p3;
+  } 
+
+  static Double scoreIndri (RetrievalModelIndri rm, double tf, double ctf, double doc_len, double total_field_len, double num_docs) {
+    double pqc = ctf / total_field_len;
+    double p1 = (1.0 - rm.lambda) * ((tf + (rm.mu * pqc)) / (doc_len + rm.mu));
+    double p2 = rm.lambda * pqc;
+    return p1 + p2;
+  }
+
+  private static ScoreAndCount featurePair(RetrievalModelBM25 bm25, 
+                                           RetrievalModelIndri indri, 
+                                           Set<String> queryTokens, 
+                                           int docid, 
+                                           String field, 
+                                           double total_field_len,
+                                           double avg_doc_len, 
+                                           double num_docs) throws IOException {
+
+    double scoreBM25 = 0.0;
+    Double scoreIndri = 1.0;
+    int count = 0;
+    TermVector tv = new TermVector(docid, field); 
+
+    if (tv.stemsLength() == 0 && tv.positionsLength() == 0) {
+      return new ScoreAndCount(null, null, null);
+    }
+
+    double doc_len = (double)tv.positionsLength();
+    Map<String, Double> ctfs = new HashMap<String, Double>();
+    
+
+    for (int i = 0; i < tv.stemsLength(); ++i) {
+      String stem = tv.stemString(i); 
+      if (stem == null) {
+        continue;
+      }
+      String combined = stem + "." + field;
+      double ctf = 0.0;
+      if (ctfs.containsKey(combined)) {
+        ctf = ctfs.get(combined);
+      } else {
+        ctf = (double)Idx.getTotalTermFreq(field, stem);
+        ctfs.put(combined, ctf);
+      }
+      
+      double tf = (double)tv.stemFreq(i);
+      double df = Idx.getDocFreq(field, stem); 
+
+      
+      if (queryTokens.contains(stem)) {
+        scoreBM25 += scoreBM25(bm25, tf, df, doc_len, avg_doc_len, num_docs);
+        scoreIndri *= scoreIndri(indri, tf, ctf, doc_len, total_field_len, num_docs);
+        count += 1;
+      }
+    }
+
+    if (count != 0) {
+      scoreIndri = Math.pow(scoreIndri, (1.0 / ((double)queryTokens.size()))); 
+      // scoreIndri = Math.pow(scoreIndri, (1.0 / ((double)count))); 
+    } else {
+      scoreIndri = null;
+    }
+    
+    return new ScoreAndCount(scoreBM25, scoreIndri, (double)count);
+  }
+
+  static void normalizeFeatureValues(ArrayList<FeatureVectorFileLine> fvfls) {
+    for (int i = 1; i < QryEval.LAST_FEATURE; ++i) {
+      Double min = null;
+      Double max = null;
+      for (FeatureVectorFileLine fvfl : fvfls) {
+        Double cur = fvfl.fv.getFeature(i);
+        if (cur != null) {
+          if (min == null) {
+            min = cur;
+            max = cur;
+          } else {
+            min = Double.min(min, cur); 
+            max = Double.max(max, cur); 
+          }
+        }
+      }
+      // System.out.println(i + ":MAX: " + max + " MIN:" + min);
+      Double diff = min == null ? null : max - min; 
+
+      for (FeatureVectorFileLine fvfl : fvfls) {
+        Double cur = fvfl.fv.getFeature(i);
+        if (cur != null && diff != 0.0) {
+          fvfl.fv.setFeature(i, (cur - min) / diff); 
+        }
+        else {
+          cur = 0.0; 
+        }
+      }
+    }
+     
+  } 
+
+  static ArrayList<FeatureVectorFileLine> createFeatureVectorFile (String outputPath,                  
+                                       String inputPath,
+                                       boolean isSVMRank, 
+                                       RetrievalModelIndri indri,
+                                       RetrievalModelBM25 bm25,
+                                       Map<String, ArrayList<FeatureVectorFileLine>> mappings,
+                                       Set<Integer> disabledFeatures,
+                                       String topN, 
+                                       boolean testQueries) throws Exception {
+   
+    File inputFile = new File (inputPath);
+
+    if (! inputFile.canRead ()) {
+      throw new IllegalArgumentException
+        ("Can't read " + inputPath);
+    }
+
+    Scanner scan = new Scanner(inputFile);
+    
+    String line = null;
+    
+
+    double num_docs_n = (double)Idx.getNumDocs();
+    double num_docs_body = (double)(Idx.getDocCount("body"));
+    double num_docs_title = (double)(Idx.getDocCount("title"));
+    double num_docs_url = (double)(Idx.getDocCount("url"));
+    double num_docs_inlink = (double)(Idx.getDocCount("inlink"));
+
+    double total_field_len_body = (double)(Idx.getSumOfFieldLengths("body"));
+    double total_field_len_title = (double)(Idx.getSumOfFieldLengths("title"));
+    double total_field_len_url = (double)(Idx.getSumOfFieldLengths("url"));
+    double total_field_len_inlink = (double)(Idx.getSumOfFieldLengths("inlink"));
+
+    double avg_doc_len_body = total_field_len_body / num_docs_body;
+    double avg_doc_len_title = total_field_len_title / num_docs_title;
+    double avg_doc_len_url = total_field_len_url / num_docs_url;
+    double avg_doc_len_inlink = total_field_len_inlink / num_docs_inlink;
+
+    FileWriter myWriter = new FileWriter(outputPath, true);
+    ArrayList<FeatureVectorFileLine> fileLines = new ArrayList<>();
+
+    do {
+      line = scan.nextLine();
+      String[] items = line.split (":");
+      String queryId = items[0];
+      String query = items[1];
+      String[] tokens = QryParser.tokenizeString(query);
+      Set<String> queryTokens = new HashSet<String>();
+
+      for (String token : tokens) {
+        queryTokens.add(token); 
+      }
+
+      ArrayList<FeatureVectorFileLine> fvfls;
+      if (testQueries) {
+        fvfls = new ArrayList<>();
+        ScoreList sl = processQuery(query, topN, bm25);
+        for (int i = 0; i < sl.size(); ++i) {
+          int docid = sl.getDocid(i); 
+          String externalDocid = Idx.getExternalDocid(docid);
+          FeatureVector fv = new FeatureVector();
+          fvfls.add(new FeatureVectorFileLine(0, docid, externalDocid, queryId, fv));
+        }
+      } else {
+        fvfls = mappings.get(queryId);
+      }
+      
+      for (FeatureVectorFileLine fvfl : fvfls) {
+        int docid = fvfl.internalDocid;
+
+        String spamAttrib = Idx.getAttribute("spamScore", docid);
+        String rawUrl = Idx.getAttribute ("rawUrl", docid);
+        String pgRank = Idx.getAttribute ("PageRank", docid);
+
+        Double spamScore = spamAttrib == null ? null : Double.parseDouble(spamAttrib);
+        Double urlDepth = rawUrl == null ? null : (double)(rawUrl.chars().filter(num -> num == '/').count());
+        Double fromWikipedia = rawUrl == null ? null : (rawUrl.contains("wikipedia.org") ? 1.0 : 0.0);
+        Double prScore = pgRank == null ? null : Double.parseDouble(pgRank);
+
+        ScoreAndCount sacBody = featurePair(bm25, indri, queryTokens, docid, "body", total_field_len_body, avg_doc_len_body, num_docs_n);
+        ScoreAndCount sacTitle = featurePair(bm25, indri, queryTokens, docid, "title", total_field_len_title, avg_doc_len_title, num_docs_n);
+        ScoreAndCount sacUrl = featurePair(bm25, indri, queryTokens, docid, "url", total_field_len_url, avg_doc_len_url, num_docs_n);
+        ScoreAndCount sacInlink = featurePair(bm25, indri, queryTokens, docid, "inlink", total_field_len_inlink, avg_doc_len_inlink, num_docs_n);
+
+
+        fvfl.fv.setFeature(1, spamScore);
+        fvfl.fv.setFeature(2, urlDepth);
+        fvfl.fv.setFeature(3, fromWikipedia);
+        fvfl.fv.setFeature(4, prScore);
+        fvfl.fv.setFeature(5, sacBody.scoreBM25);
+        fvfl.fv.setFeature(6, sacBody.scoreIndri);
+        fvfl.fv.setFeature(7, sacBody.count);
+        fvfl.fv.setFeature(8, sacTitle.scoreBM25);
+        fvfl.fv.setFeature(9, sacTitle.scoreIndri);
+        fvfl.fv.setFeature(10, sacBody.count);
+        fvfl.fv.setFeature(11, sacUrl.scoreBM25);
+        fvfl.fv.setFeature(12, sacTitle.scoreIndri);
+        fvfl.fv.setFeature(13, sacBody.count);
+        fvfl.fv.setFeature(14, sacInlink.scoreBM25);
+        fvfl.fv.setFeature(15, sacTitle.scoreIndri);
+        fvfl.fv.setFeature(16, sacBody.count);
+      } 
+
+      if (isSVMRank) {
+          
+        normalizeFeatureValues(fvfls);
+      }
+     
+      for (FeatureVectorFileLine fvfl : fvfls) { 
+        myWriter.write(fvfl.toString(isSVMRank, disabledFeatures));
+        fileLines.add(fvfl);
+      }
+
+    } while (scan.hasNext()); 
+
+    myWriter.close();
+    scan.close();
+    return fileLines;
+  }
+
+  private static void sortAndOutputFinalLtrResults (String outputPath,
+                                                    String inputPath,
+                                                    boolean isSVMRank,
+                                                    ArrayList<FeatureVectorFileLine> fileLines,
+                                                    int topN) throws Exception {
+    File inputFile = new File (inputPath);
+
+    if (! inputFile.canRead ()) {
+      throw new IllegalArgumentException
+        ("Can't read " + inputPath);
+    }
+
+    Scanner scan = new Scanner(inputFile);
+    
+    String line = null;
+    
+
+
+    FileWriter myWriter = new FileWriter(outputPath, true);
+    String currentQueryId = null;
+    ScoreList currentScoreList = new ScoreList();
+    int i = 0;
+    do {
+      line = scan.nextLine();
+      FeatureVectorFileLine fvfl = fileLines.get(i);
+      int docid = fvfl.internalDocid;
+      if (currentQueryId == null) {
+        currentQueryId = fvfl.queryId; 
+      } else if (currentQueryId != fvfl.queryId) {
+        currentScoreList.sort(); 
+        currentScoreList.truncate(topN); 
+        printResults(currentQueryId, currentScoreList, outputPath);
+        currentQueryId = fvfl.queryId;
+        currentScoreList = new ScoreList();
+      }
+      double score = 0.0;
+      if (isSVMRank) {
+        String strippedLine = line.strip();
+        score = Double.parseDouble(strippedLine);
+      } else {
+        String[] items = line.strip().split ("\\s+");
+        String lineQueryId = items[0];
+        String lineScore = items[2];
+        score = Double.parseDouble(lineScore);
+      }
+      currentScoreList.add(docid, score);
+
+      i++;
+        // myWriter.write(fvfl.toString(isSVMRank, disabledFeatures));
+    } while (scan.hasNext()); 
+
+    myWriter.close();
+    scan.close();                    
+  }
+
+  private static void performLearningToRank (Map<String, String> parameters) 
+    throws Exception{
+    
+    Set<Integer> disabledFeatures = findFeaturesToDisable(parameters);
+    RetrievalModelIndri indri = new RetrievalModelIndri(Integer.parseInt(parameters.get("Indri:mu")), 
+                                                   Double.parseDouble(parameters.get("Indri:lambda")));
+
+    RetrievalModelBM25 bm25 = new RetrievalModelBM25(Double.parseDouble(parameters.get("BM25:k_1")),
+                                                 Double.parseDouble(parameters.get("BM25:b")),
+                                                 Double.parseDouble(parameters.get("BM25:k_3")));
+
+    Map<String, ArrayList<FeatureVectorFileLine>> mappings = initializeFeatureVectors(parameters.get("ltr:trainingQrelsFile"));
+
+    boolean isSVMRank = parameters.get("ltr:toolkit").strip().toLowerCase().equals("svmrank");
+
+    /* 
+    if (isSVMRank) {
+      Utils.runExternalProcess (
+      "svm_rank_learn", 
+      new String[] {
+          parameters.get("ltr:svmRankLearnPath"), // svmRankLearnPath,            // From the parameter file
+          "-c", parameters.get("ltr:svmRankParamC"), // svmRankParamC,         // From the parameter file
+          parameters.get("ltr:trainingFeatureVectorsFile"), // TrainingFeatureVectorsFile,  // From the parameter file
+          parameters.get("ltr:modelFile") } );               // From the parameter file 
+    } else {
+      Evaluator.main (
+      new String[] {
+          "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
+          "-metric2t", parameters.get("ltr:RankLib:metric2t"),         // From the parameter file
+          "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
+          "-save", parameters.get("ltr:modelFile") } );                // From the parameter file
+    }
+    */
+    createFeatureVectorFile(parameters.get("ltr:trainingFeatureVectorsFile"),
+                            parameters.get("ltr:trainingQueryFile"),
+                            isSVMRank,
+                            indri,
+                            bm25,
+                            mappings,
+                            disabledFeatures,
+                            parameters.get("trecEvalOutputLength"),
+                            false); 
+    // train
+    if (isSVMRank) {
+      Utils.runExternalProcess (
+      "svm_rank_learn", 
+      new String[] {
+          parameters.get("ltr:svmRankLearnPath"), // svmRankLearnPath,            // From the parameter file
+          "-c", parameters.get("ltr:svmRankParamC"), // svmRankParamC,         // From the parameter file
+          parameters.get("ltr:trainingFeatureVectorsFile"), // TrainingFeatureVectorsFile,  // From the parameter file
+          parameters.get("ltr:modelFile") } );               // From the parameter file 
+    } else {
+      int ranker = Integer.parseInt(parameters.get("ltr:RankLib:model"));
+      if (ranker == 4) {
+        Evaluator.main (
+        new String[] {
+          "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
+          "-metric2t", parameters.get("ltr:RankLib:metric2t"),         // From the parameter file
+          "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
+          "-save", parameters.get("ltr:modelFile") } );                // From the parameter file
+      } else {
+        Evaluator.main (
+        new String[] {
+            "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
+            "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
+            "-save", parameters.get("ltr:modelFile") } );                // From the parameter file
+      }
+      
+    }
+
+    ArrayList<FeatureVectorFileLine> fileLines = 
+                            createFeatureVectorFile(parameters.get("ltr:testingFeatureVectorsFile"),
+                            parameters.get("queryFilePath"),
+                            isSVMRank,
+                            indri,
+                            bm25,
+                            mappings,
+                            disabledFeatures,
+                            parameters.get("trecEvalOutputLength"),
+                            true);
+
+    if (isSVMRank) {
+      Utils.runExternalProcess (
+      "svm_rank_learn", 
+      new String[] {
+          parameters.get("ltr:svmRankClassifyPath"), // svmRankLearnPath,            // From the parameter file
+          parameters.get("ltr:testingFeatureVectorsFile"), // TrainingFeatureVectorsFile,  // From the parameter file
+          parameters.get("ltr:modelFile"),
+          parameters.get("ltr:testingDocumentScores"),
+          "-c", parameters.get("ltr:svmRankParamC"), } );               // From the parameter file 
+    } else {
+      int ranker = Integer.parseInt(parameters.get("ltr:RankLib:model"));
+      if (ranker == 4) {
+        Evaluator.main (
+        new String[] {
+          "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
+          "-metric2t", parameters.get("ltr:RankLib:metric2t"),         // From the parameter file
+          "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
+          "-test", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
+      } else {
+        Evaluator.main (
+        new String[] {
+            "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
+            "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
+            "-save", parameters.get("ltr:modelFile"),
+            "-test", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
+      }
+    } 
+
+    int topN = Integer.parseInt(parameters.get("trecEvalOutputLength"));
+    sortAndOutputFinalLtrResults(parameters.get("trecEvalOutputPath"), 
+                                 parameters.get("ltr:testingDocumentScores"),
+                                 isSVMRank,
+                                 fileLines,
+                                 topN);
+  } 
 
   /**
    *  Allocate the retrieval model and initialize it using parameters
@@ -320,6 +805,8 @@ public class QryEval {
   }
 
 
+  
+ 
   /**
    *  Process the query file.
    *  @param queryFilePath Path to the query file
@@ -499,7 +986,7 @@ public class QryEval {
       FileWriter myWriter = new FileWriter(expansionQueryFilePath, true);
       if (expandedQuery.size() == 0) {
         // System.out.println(queryName + " Q0 dummy 1 0 ?");
-        System.out.println("NO EXPANSION TERMS? ");
+        // System.out.println("NO EXPANSION TERMS? ");
         assert(false);
       } else {
         System.out.println("YES EXPANSION TERMS ");
