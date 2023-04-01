@@ -155,11 +155,34 @@ public class QryEval {
     public Double scoreBM25; 
     public Double scoreIndri; 
     public Double count;
+    public Double idfWeightedMatch;
+    public Double minDistanceBetween;
+    public Double documentVectorLength;
+    public Double documentQueryVectorInnerProduct;
+    public Double rarestZipfRank;
 
-    public ScoreAndCount(Double scoreBM25, Double scoreIndri, Double count) {
+    public ScoreAndCount () {
+      this.scoreBM25 = null; 
+      this.scoreIndri = null;
+      this.count = null;
+      this.idfWeightedMatch = null;
+      this.minDistanceBetween = null;
+      this.documentVectorLength = null;
+      this.documentQueryVectorInnerProduct = null;
+      this.rarestZipfRank = null; 
+    }
+
+    public ScoreAndCount(Double scoreBM25, Double scoreIndri, Double count, Double idfWeightedMatch,
+                         Double minDistanceBetween, Double documentVectorLength, Double documentQueryVectorInnerProduct,
+                         Double rarestZipfRank) {
       this.scoreBM25 = scoreBM25; 
       this.scoreIndri = scoreIndri;
       this.count = count;
+      this.idfWeightedMatch = idfWeightedMatch;
+      this.minDistanceBetween = minDistanceBetween;
+      this.documentVectorLength = documentVectorLength;
+      this.documentQueryVectorInnerProduct = documentQueryVectorInnerProduct;
+      this.rarestZipfRank = rarestZipfRank;
     }
   } 
 
@@ -172,7 +195,7 @@ public class QryEval {
   } 
 
   static Double scoreIndri (RetrievalModelIndri rm, double tf, double ctf, double doc_len, double total_field_len, double num_docs) {
-    double pqc = ctf / total_field_len;
+    double pqc = ctf == 0.0 ? (0.5 / total_field_len) : (ctf / total_field_len);
     double p1 = (1.0 - rm.lambda) * ((tf + (rm.mu * pqc)) / (doc_len + rm.mu));
     double p2 = rm.lambda * pqc;
     return p1 + p2;
@@ -180,33 +203,45 @@ public class QryEval {
 
   private static ScoreAndCount featurePair(RetrievalModelBM25 bm25, 
                                            RetrievalModelIndri indri, 
-                                           Set<String> queryTokens, 
+                                           Map<String, Integer> queryTokens, 
                                            int docid, 
                                            String field, 
                                            double total_field_len,
                                            double avg_doc_len, 
-                                           double num_docs) throws IOException {
+                                           double num_docs,
+                                           double num_docs_field,
+                                           double num_words,
+                                           Map<String, Double> ctfs) throws IOException {
 
     double scoreBM25 = 0.0;
     Double scoreIndri = 1.0;
+    Double rarestZipfRank = 0.0;
     int count = 0;
     TermVector tv = new TermVector(docid, field); 
 
     if (tv.stemsLength() == 0 && tv.positionsLength() == 0) {
-      return new ScoreAndCount(null, null, null);
+      return new ScoreAndCount();
     }
 
     double doc_len = (double)tv.positionsLength();
-    Map<String, Double> ctfs = new HashMap<String, Double>();
+    double num_tokens = (double)queryTokens.size();
     
+    Double weightedIdf = 0.0;
+    Double docVectorMag = 0.0;
+    Double innerProd = 0.0;
+    Double minDistanceScore = 0.0;
+
+    Set<String> matches = new HashSet<String>();
 
     for (int i = 0; i < tv.stemsLength(); ++i) {
       String stem = tv.stemString(i); 
       if (stem == null) {
         continue;
       }
-      
-      if (queryTokens.contains(stem)) {
+      docVectorMag += (tv.stemFreq(i) * tv.stemFreq(i)); 
+      if (queryTokens.containsKey(stem) && tv.indexOfStem(stem) != -1) {
+        matches.add(stem);
+
         String combined = stem + "." + field;
         double ctf = 0.0;
         if (ctfs.containsKey(combined)) {
@@ -218,21 +253,54 @@ public class QryEval {
         
         double tf = (double)tv.stemFreq(i);
         double df = Idx.getDocFreq(field, stem); 
+        double idf = Math.log(num_docs / ((double)Idx.getDocFreq(field, stem)));
 
+        weightedIdf += idf * tf;
         scoreBM25 += scoreBM25(bm25, tf, df, doc_len, avg_doc_len, num_docs);
-        scoreIndri *= scoreIndri(indri, tf, ctf, doc_len, total_field_len, num_docs);
+        double termScoreIndri = scoreIndri(indri, tf, ctf, doc_len, total_field_len, num_docs);
+        scoreIndri *= Math.pow(termScoreIndri, (1.0 / num_tokens));
         count += 1;
+
+        rarestZipfRank = Math.max(rarestZipfRank, Math.log((tf * 0.1 * num_words) / ctf));
+        innerProd += (tf * queryTokens.get(stem));
       }
     }
 
-    if (count != 0) {
-      scoreIndri = Math.pow(scoreIndri, (1.0 / ((double)queryTokens.size()))); 
-      // scoreIndri = Math.pow(scoreIndri, (1.0 / ((double)count))); 
+    if (count == 0) {
+      scoreIndri = 0.0;
+      rarestZipfRank = null;
+      minDistanceScore = null;
     } else {
-      scoreIndri = null;
-    }
-    
-    return new ScoreAndCount(scoreBM25, scoreIndri, (double)count);
+      Integer minDistance = Integer.MAX_VALUE;
+      int total = 0;
+      int prev = -1;
+      for (int i = 0 ; i < tv.positionsLength(); ++i) {
+        if (matches.contains(tv.stemAt(i))) {
+          total++;
+          if (prev == -1) {
+            prev = i;
+          } else {
+            minDistance = Integer.min(minDistance, i - prev);
+            prev = i;
+          }
+        } 
+      }
+      if (total == 1) {
+        minDistanceScore = 0.0;
+      } else {
+        minDistanceScore = 1.0 / ((double)minDistance);
+      }
+      
+    } 
+    /*
+     * 
+     * 
+     * Double scoreBM25, Double scoreIndri, Double count, Double idfWeightedMatch,
+                         Double minDistanceBetween, Double documentVectorLength, Double documentQueryVectorInnerProduct,
+                         Double rarestZipfRank) {
+     */
+    return new ScoreAndCount(scoreBM25, scoreIndri, (double)count, weightedIdf, 
+                             minDistanceScore, docVectorMag, innerProd, rarestZipfRank);
   }
 
   static void normalizeFeatureValues(ArrayList<FeatureVectorFileLine> fvfls) {
@@ -299,6 +367,7 @@ public class QryEval {
     double total_field_len_title = (double)(Idx.getSumOfFieldLengths("title"));
     double total_field_len_url = (double)(Idx.getSumOfFieldLengths("url"));
     double total_field_len_inlink = (double)(Idx.getSumOfFieldLengths("inlink"));
+    double total_words = total_field_len_body + total_field_len_title + total_field_len_url + total_field_len_inlink;
 
     double avg_doc_len_body = total_field_len_body / num_docs_body;
     double avg_doc_len_title = total_field_len_title / num_docs_title;
@@ -308,17 +377,29 @@ public class QryEval {
     FileWriter myWriter = new FileWriter(outputPath, true);
     ArrayList<FeatureVectorFileLine> fileLines = new ArrayList<>();
 
+    Map<String, Double> ctfs = new HashMap<String, Double>();
     do {
       line = scan.nextLine();
       String[] items = line.split (":");
       String queryId = items[0];
       String query = items[1];
       String[] tokens = QryParser.tokenizeString(query);
-      Set<String> queryTokens = new HashSet<String>();
+      Map<String, Integer> queryVector = new HashMap<String, Integer>();
 
       for (String token : tokens) {
-        queryTokens.add(token); 
+        int old = 0;
+        if (queryVector.containsKey(token)) {
+          old = queryVector.get(token);
+        } 
+        queryVector.put(token, old + 1);
       }
+      int totalQueryVectorMagnitude = 0;
+      for (Integer i : queryVector.values()) {
+        totalQueryVectorMagnitude += i * i;
+      }
+      double queryVectorLength = Math.sqrt((double)totalQueryVectorMagnitude);
+
+
 
       ArrayList<FeatureVectorFileLine> fvfls;
       if (testQueries) {
@@ -332,9 +413,6 @@ public class QryEval {
         }
       } else {
         fvfls = mappings.get(queryId);
-        if (fvfls == null) {
-          System.out.println("QUERY ID:" + queryId);
-        }
       }
       
       for (FeatureVectorFileLine fvfl : fvfls) {
@@ -349,10 +427,10 @@ public class QryEval {
         Double fromWikipedia = rawUrl == null ? null : (rawUrl.contains("wikipedia.org") ? 1.0 : 0.0);
         Double prScore = pgRank == null ? null : Double.parseDouble(pgRank);
 
-        ScoreAndCount sacBody = featurePair(bm25, indri, queryTokens, docid, "body", total_field_len_body, avg_doc_len_body, num_docs_n);
-        ScoreAndCount sacTitle = featurePair(bm25, indri, queryTokens, docid, "title", total_field_len_title, avg_doc_len_title, num_docs_n);
-        ScoreAndCount sacUrl = featurePair(bm25, indri, queryTokens, docid, "url", total_field_len_url, avg_doc_len_url, num_docs_n);
-        ScoreAndCount sacInlink = featurePair(bm25, indri, queryTokens, docid, "inlink", total_field_len_inlink, avg_doc_len_inlink, num_docs_n);
+        ScoreAndCount sacBody = featurePair(bm25, indri, queryVector, docid, "body", total_field_len_body, avg_doc_len_body, num_docs_n, num_docs_body, total_words, ctfs);
+        ScoreAndCount sacTitle = featurePair(bm25, indri, queryVector, docid, "title", total_field_len_title, avg_doc_len_title, num_docs_n, num_docs_title, total_words, ctfs);
+        ScoreAndCount sacUrl = featurePair(bm25, indri, queryVector, docid, "url", total_field_len_url, avg_doc_len_url, num_docs_n, num_docs_url, total_words, ctfs);
+        ScoreAndCount sacInlink = featurePair(bm25, indri, queryVector, docid, "inlink", total_field_len_inlink, avg_doc_len_inlink, num_docs_n, num_docs_inlink, total_words, ctfs);
 
 
         fvfl.fv.setFeature(1, spamScore);
@@ -364,13 +442,31 @@ public class QryEval {
         fvfl.fv.setFeature(7, sacBody.count);
         fvfl.fv.setFeature(8, sacTitle.scoreBM25);
         fvfl.fv.setFeature(9, sacTitle.scoreIndri);
-        fvfl.fv.setFeature(10, sacBody.count);
+        fvfl.fv.setFeature(10, sacTitle.count);
         fvfl.fv.setFeature(11, sacUrl.scoreBM25);
-        fvfl.fv.setFeature(12, sacTitle.scoreIndri);
-        fvfl.fv.setFeature(13, sacBody.count);
+        fvfl.fv.setFeature(12, sacUrl.scoreIndri);
+        fvfl.fv.setFeature(13, sacUrl.count);
         fvfl.fv.setFeature(14, sacInlink.scoreBM25);
-        fvfl.fv.setFeature(15, sacTitle.scoreIndri);
-        fvfl.fv.setFeature(16, sacBody.count);
+        fvfl.fv.setFeature(15, sacInlink.scoreIndri);
+        fvfl.fv.setFeature(16, sacInlink.count);
+
+        // idf weighitng
+        fvfl.fv.setFeature(17, sacInlink.idfWeightedMatch);
+
+        // Cosine similarity
+        if (sacTitle.documentVectorLength == null) {
+          fvfl.fv.setFeature(18, null);
+        } else {
+          double titleCosineSimilarity = 
+          sacTitle.documentQueryVectorInnerProduct / (sacTitle.documentVectorLength * queryVectorLength);
+          fvfl.fv.setFeature(18, titleCosineSimilarity);
+        }
+        
+        // Min distance 
+        fvfl.fv.setFeature(19, sacInlink.minDistanceBetween);
+
+        // Rarest zipfs law 
+        fvfl.fv.setFeature(20, sacInlink.rarestZipfRank);
       } 
 
       if (isSVMRank) {
@@ -444,7 +540,7 @@ public class QryEval {
     if (currentScoreList.size() != 0) {
       printResults(currentQueryId, currentScoreList, outputPath); 
     }
-    
+
     myWriter.close();
     scan.close();                    
   }
@@ -464,24 +560,7 @@ public class QryEval {
 
     boolean isSVMRank = parameters.get("ltr:toolkit").strip().toLowerCase().equals("svmrank");
 
-    /* 
-    if (isSVMRank) {
-      Utils.runExternalProcess (
-      "svm_rank_learn", 
-      new String[] {
-          parameters.get("ltr:svmRankLearnPath"), // svmRankLearnPath,            // From the parameter file
-          "-c", parameters.get("ltr:svmRankParamC"), // svmRankParamC,         // From the parameter file
-          parameters.get("ltr:trainingFeatureVectorsFile"), // TrainingFeatureVectorsFile,  // From the parameter file
-          parameters.get("ltr:modelFile") } );               // From the parameter file 
-    } else {
-      Evaluator.main (
-      new String[] {
-          "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
-          "-metric2t", parameters.get("ltr:RankLib:metric2t"),         // From the parameter file
-          "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
-          "-save", parameters.get("ltr:modelFile") } );                // From the parameter file
-    }
-    */
+    
     createFeatureVectorFile(parameters.get("ltr:trainingFeatureVectorsFile"),
                             parameters.get("ltr:trainingQueryFile"),
                             isSVMRank,
@@ -544,18 +623,26 @@ public class QryEval {
       if (ranker == 4) {
         Evaluator.main (
         new String[] {
-          "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
+          "-load", parameters.get("ltr:modelFile"),              // From the parameter file
           "-metric2t", parameters.get("ltr:RankLib:metric2t"),         // From the parameter file
-          "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
-          "-test", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
+          "-rank", parameters.get("ltr:testingFeatureVectorsFile"),  // From the parameter file
+          "-score", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
       } else {
         Evaluator.main (
         new String[] {
-            "-ranker", parameters.get("ltr:RankLib:model"),              // From the parameter file
-            "-train", parameters.get("ltr:trainingFeatureVectorsFile"),  // From the parameter file
-            "-save", parameters.get("ltr:modelFile"),
-            "-test", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
+            "-load", parameters.get("ltr:modelFile"),              // From the parameter file
+            "-rank", parameters.get("ltr:testingFeatureVectorsFile"),  // From the parameter file
+            "-score", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
       }
+      /* 
+      // if (ranker == 4) {
+        Evaluator.main (
+        new String[] {
+          "-load", parameters.get("ltr:RankLib:model"),              // From the parameter file
+          "-rank", parameters.get("ltr:testingFeatureVectorsFile"),  // From the parameter file
+          "-score", parameters.get("ltr:testingDocumentScores") } );                // From the parameter file
+      // }
+       */
     } 
 
     int topN = Integer.parseInt(parameters.get("trecEvalOutputLength"));
