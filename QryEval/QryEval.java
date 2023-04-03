@@ -270,7 +270,7 @@ public class QryEval {
       scoreIndri = 0.0;
       rarestZipfRank = null;
       minDistanceScore = null;
-    } else {
+    } else if (field == "title") {
       Integer minDistance = Integer.MAX_VALUE;
       int total = 0;
       int prev = -1;
@@ -290,7 +290,8 @@ public class QryEval {
       } else {
         minDistanceScore = 1.0 / ((double)minDistance);
       }
-      
+    } else if (field == "body") {
+      rarestZipfRank /= tv.positionsLength(); 
     } 
     /*
      * 
@@ -451,7 +452,7 @@ public class QryEval {
         fvfl.fv.setFeature(16, sacInlink.count);
 
         // idf weighitng
-        fvfl.fv.setFeature(17, sacInlink.idfWeightedMatch);
+        fvfl.fv.setFeature(17, sacUrl.idfWeightedMatch);
 
         // Cosine similarity
         if (sacTitle.documentVectorLength == null) {
@@ -463,10 +464,10 @@ public class QryEval {
         }
         
         // Min distance 
-        fvfl.fv.setFeature(19, sacInlink.minDistanceBetween);
+        fvfl.fv.setFeature(19, sacTitle.minDistanceBetween);
 
         // Rarest zipfs law 
-        fvfl.fv.setFeature(20, sacInlink.rarestZipfRank);
+        fvfl.fv.setFeature(20, sacBody.rarestZipfRank);
       } 
 
       if (isSVMRank) {
