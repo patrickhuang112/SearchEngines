@@ -24,27 +24,28 @@ public class FeatureVectorFileLine {
     toWrite.append(" qid:");
     toWrite.append(queryId);
     toWrite.append(" "); 
-    int toPrintFeature = 1;
+    // int toPrintFeature = 1;
     if (forSvm) {
       for (int i = 1; i < QryEval.LAST_FEATURE; ++i) {
         if (disabledFeatures.contains(i)) {
+          // toPrintFeature++;
           continue; 
         }
         Double val = fv.getFeature(i);
         if (val != null) {
-          toWrite.append(toPrintFeature); 
+          toWrite.append(i); 
           toWrite.append(":");
           toWrite.append(val.toString()); 
           toWrite.append(" ");
         } 
-        toPrintFeature++; 
+        // toPrintFeature++; 
       }
     } else {
       for (int i = 1; i < QryEval.LAST_FEATURE; ++i) {
         if (disabledFeatures.contains(i)) {
           continue; 
         } 
-        toWrite.append(toPrintFeature); 
+        toWrite.append(i); 
         toWrite.append(":"); 
         Double val = fv.getFeature(i);
         if (val == null) {
@@ -53,7 +54,6 @@ public class FeatureVectorFileLine {
           toWrite.append(val.toString()); 
         }
         toWrite.append(" ");
-        toPrintFeature++;
       }
     }
     toWrite.append("# "); 

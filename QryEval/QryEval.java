@@ -74,6 +74,10 @@ public class QryEval {
         parameters.get("retrievalAlgorithm").equals("ltr")) {
       performLearningToRank(parameters);
 
+    } else if (parameters.containsKey("diversity") && 
+               parameters.get("diversity").toLowerCase().equals("true")) {
+      RetrievalModel model = initializeRetrievalModel (parameters); 
+      performDiversification(parameters, model);
     } else {
       //  Perform experiments.
       RetrievalModel model = initializeRetrievalModel (parameters);
@@ -85,6 +89,401 @@ public class QryEval {
     
     timer.stop ();
     System.out.println ("Time:  " + timer);
+  }
+
+  private static class QueryAndIntents {
+    public String qid = "";
+    public ScoreList queryScoreList = new ScoreList();
+    public ArrayList<ScoreList> intentScoreLists = new ArrayList<>();
+    public ArrayList<String> intents = new ArrayList<>();
+    public Map<Integer, List<Double>> intentScores  = new HashMap<>();
+    public Double largest = Double.MIN_VALUE;
+
+    public void normalize(int maxInputDocs) {
+      boolean needsNormalize = false;
+      int limit = Integer.min(maxInputDocs, queryScoreList.size());
+
+      // Truncate all first
+      queryScoreList.sort();
+      queryScoreList.truncate(limit);
+      queryScoreList.sort();
+      for (int i = 1; i < intentScoreLists.size(); ++i) {
+        ScoreList isl = intentScoreLists.get(i);
+        isl.sort();
+        isl.truncate(limit); 
+        isl.sort();
+      }
+
+      Set<Integer> queryRankingDocids = new HashSet<>(); 
+      for (int i = 0 ; i < queryScoreList.size(); ++i) {
+        int docid = queryScoreList.getDocid(i);
+        queryRankingDocids.add(docid); 
+        intentScores.put(docid, new ArrayList<Double>(Collections.nCopies(intentScoreLists.size(), 0.0)));
+      }
+      Double sum = 0.0;
+      largest = Double.MIN_VALUE;
+      for (int i = 1; i < intentScoreLists.size(); ++i) {
+        ScoreList isl = intentScoreLists.get(i);
+        sum = 0.0;
+        int k = 0;
+        for (int j = 0; j < isl.size(); ++j) {
+          int docid = isl.getDocid(j);
+          double docScore = 0.0; 
+          if (queryRankingDocids.contains(docid)) {
+            k++;
+            docScore = isl.getDocidScore(j);
+            if (docScore > 1.0) {
+              needsNormalize = true; 
+            }
+            try {
+              // System.out.println("DOCSCORE: " + docScore + ", for docid: " + Idx.getExternalDocid(docid) );
+            } catch (Exception e) {
+
+            }
+            sum += docScore;
+            intentScores.get(docid).set(i, docScore);
+          } 
+        }
+        // System.out.println("SUM_intent_" + i + ": " + sum);
+        largest = Double.max(largest, sum); 
+      }
+      sum = 0.0;
+      for (int j = 0; j < queryScoreList.size(); ++j) {
+        double score = queryScoreList.getDocidScore(j);
+        if (score > 1.0) {
+          needsNormalize = true; 
+        } 
+        sum += score;
+      }
+      // System.out.println("SUM_query: " + sum);
+      largest = Double.max(largest, sum); 
+      if (!needsNormalize) {
+        largest = 1.0; 
+      }
+
+      /* 
+      // Largest value found, normalize all scores now
+      for (int i = 0 ; i < queryScoreList.size(); ++i) {
+        double prevScore = queryScoreList.getDocidScore(i);
+        queryScoreList.setDocidScore(i, prevScore / largest);
+      }
+      */
+    }
+
+    public QueryAndIntents (String qid, ScoreList qsl, ArrayList<ScoreList> isl) {
+      this.qid = qid;
+      queryScoreList = qsl; 
+      intentScoreLists = isl;
+    } 
+
+    public QueryAndIntents (String qid, ArrayList<String> intents) {
+      this.qid = qid;
+      this.intents = intents;
+    }
+
+    public void setScoreLists(ScoreList qsl, ArrayList<ScoreList> isl) {
+      queryScoreList = qsl; 
+      intentScoreLists = isl;
+    }
+
+    public Double getQueryScore(int position) {
+      return queryScoreList.getDocidScore(position) / largest;
+    }
+
+    public Double getIntentScore(int docid, int intentNumber) {
+      return intentScores.get(docid).get(intentNumber) / largest;
+    }
+
+    public void print() {
+      System.out.println("Largest: " + largest);
+      System.out.println("Query Id: " + qid);
+      System.out.println("Query scorelist: ");
+      for (int j = 0; j < queryScoreList.size(); ++j) {
+        int docid = queryScoreList.getDocid(j);
+        double docscore = queryScoreList.getDocidScore(j);
+        System.out.println("DocID: " + docid + ", score: " + docscore);
+      }
+      System.out.println("Intent score lists: ");
+      for (int i = 1; i < intentScoreLists.size(); ++i) {
+        ScoreList sl = intentScoreLists.get(i);
+        System.out.println("Intent number: " + i);
+        for (int j = 0; j < sl.size(); ++j) {
+          int docid = sl.getDocid(j);
+          double docscore = sl.getDocidScore(j);
+          System.out.println("DocID: " + docid + ", score: " + docscore);
+        }
+      }
+      System.out.println();
+    }
+
+  } 
+  
+  private static class IndPair {
+    public int docid;
+    public int index;
+
+    IndPair(int docid, int index) {
+      this.docid = docid; 
+      this.index = index;
+    }
+  }
+
+  private static void performDiversification(Map<String, String> parameters, RetrievalModel model) throws Exception {
+    ArrayList<QueryAndIntents> qaiList = new ArrayList<>(); 
+    ScoreList queryScoreList = null;
+    ScoreList currentScoreList = new ScoreList();
+    ArrayList<ScoreList> intentScoreLists = new ArrayList<>();
+    String currentQueryId = null;
+    int currentQueryIntent = 0;
+
+    String trecEvalOutputPath = parameters.get("trecEvalOutputPath");
+
+    double lambda = Double.parseDouble(parameters.get("diversity:lambda"));
+    String searchInputDocSize = parameters.get("diversity:maxInputRankingsLength");
+    int trecEvalOutputLen = Integer.parseInt(parameters.get("trecEvalOutputLength"));
+    int maxInputDocs = Integer.parseInt(parameters.get("diversity:maxInputRankingsLength"));
+    int maxResultDocs = Integer.parseInt(parameters.get("diversity:maxResultRankingLength"));
+
+    if (parameters.containsKey("diversity:initialRankingFile")) {
+      String initialRankingFilePath = parameters.get("diversity:initialRankingFile");
+      BufferedReader initialRanking = null;
+
+      String rankingLine = null;
+      try {
+        initialRanking = new BufferedReader(new FileReader(initialRankingFilePath)); 
+        while ((rankingLine = initialRanking.readLine()) != null) {
+          // System.out.println("RANKING LINE: " + rankingLine); 
+          String[] pair = rankingLine.split (" "); 
+          // Should be 6 elements
+          String queryId = pair[0]; 
+          int docId = Idx.getInternalDocid(pair[2]);
+          double score = Double.parseDouble(pair[4]);
+          if (currentQueryId == null) {
+            currentQueryId = queryId;
+            // System.out.println("First queryID: " + currentQueryId);
+          } else if (!currentQueryId.equals(queryId)) {
+            String[] intentPair = queryId.split ("\\.");
+
+            if (intentPair.length == 2 && intentPair[0].equals(currentQueryId)) {
+              if (queryScoreList == null) {
+                // System.out.println("First Query Intent found");
+                queryScoreList = currentScoreList; 
+              }
+              Integer intent = Integer.parseInt(intentPair[1]);
+              if (currentQueryIntent != intent) {
+                // System.out.println("Different, adding to intent score lists: " + currentScoreList.size());
+                intentScoreLists.add(currentScoreList); 
+                currentScoreList = new ScoreList();
+              } 
+              // System.out.println("Current query Intent: " + currentQueryIntent + ", Intent number: " + intent + ", num of intent score lists: " + intentScoreLists.size());
+              currentQueryIntent = intent;
+              
+            } else {
+              intentScoreLists.add(currentScoreList);
+              currentQueryIntent = 0;
+              qaiList.add(new QueryAndIntents(currentQueryId, queryScoreList, intentScoreLists)); 
+
+              // System.out.println("New queryID: " + queryId + ", and split size: " + intentPair.length);
+
+              queryScoreList = null;
+              intentScoreLists = new ArrayList<>();
+              currentScoreList = new ScoreList();
+              currentQueryId = queryId;
+            }
+          }
+          currentScoreList.add(docId, score); 
+        }
+
+        if (queryScoreList != null && currentScoreList.size() > 0) {
+          intentScoreLists.add(currentScoreList);
+          qaiList.add(new QueryAndIntents(currentQueryId, queryScoreList, intentScoreLists)); 
+        }
+      } catch (Exception ex) {
+        ex.printStackTrace();
+      } finally {
+        initialRanking.close();
+      }
+    } else {
+      String qfp = parameters.get("queryFilePath");
+      String trecEvalOutputLength = parameters.get("trecEvalOutputLength");
+      String intentsFilePath = parameters.get("diversity:intentsFile");
+      BufferedReader input = null;
+      try {
+        input = new BufferedReader(new FileReader(intentsFilePath));
+        String intentLine = null;
+
+        // Pad by 1
+        ArrayList<String> intentList = new ArrayList<>();
+        intentList.add("");
+
+        while ((intentLine = input.readLine()) != null) {
+          String[] pair = intentLine.split(":"); 
+          String intent = pair[1];
+          String[] qi = (pair[0]).split("\\.");
+          currentQueryIntent = Integer.parseInt(qi[1]);
+          if (currentQueryId == null) {
+            currentQueryId = qi[0];
+          } 
+          if (!currentQueryId.equals(qi[0])) {
+            qaiList.add(new QueryAndIntents(currentQueryId, intentList));
+            currentQueryId = qi[0];
+            intentList = new ArrayList<>(); 
+            intentList.add("");
+          } 
+          intentList.add(intent);
+        }
+        
+        if (intentList.size() > 0) {
+          qaiList.add(new QueryAndIntents(currentQueryId, intentList));
+        }
+
+        String qLine = null;
+        input.close();
+        input = new BufferedReader(new FileReader(qfp));
+        
+        //  Each pass of the loop processes one query.
+        int queryIndex = 0;
+        while ((qLine = input.readLine()) != null) {
+          printMemoryUsage(false);
+          String qid;
+          String[] pair = qLine.split(":");
+          if (pair.length != 2) {
+            throw new IllegalArgumentException
+              ("Syntax error:  Each line must contain one ':'.");
+          }
+          String query = pair[1];
+          
+          qid = pair[0];
+          queryScoreList = processQuery(query, searchInputDocSize, model);
+          QueryAndIntents qai = qaiList.get(queryIndex);
+          assert(qai.qid == qid);
+          intentScoreLists = new ArrayList<>();
+          intentScoreLists.add(new ScoreList());
+          for (int j = 1; j < qai.intents.size(); ++j) {
+            String intent = qai.intents.get(j);
+            intentScoreLists.add(processQuery(intent, searchInputDocSize, model)); 
+          }
+          qai.setScoreLists(queryScoreList, intentScoreLists);
+        }
+      } catch (IOException ex) {
+        ex.printStackTrace();
+      } finally {
+        input.close();
+      }
+    }
+
+    
+    
+    for (QueryAndIntents qai : qaiList) {
+      
+      qai.normalize(maxInputDocs);
+      // System.out.println("WTF: " + maxInputDocs + ", LARGEST: " + qai.largest);
+      // qai.print();
+
+      int numIntents = qai.intentScoreLists.size() - 1;
+      int limit = Integer.min(maxInputDocs, qai.queryScoreList.size()); 
+      double pqiq = 1.0 / ((double)numIntents);
+      ScoreList result = new ScoreList();
+      Set<Integer> rankedDocs = new HashSet<>();
+      Set<Integer> docsToLook = new HashSet<>();
+      for (int i = 0; i < limit; ++i) {
+        docsToLook.add(i);
+      }
+      // PM2
+      if (parameters.get("diversity:algorithm").equals("PM2")) {
+        ArrayList<Double> v = new ArrayList<Double>(Collections.nCopies(qai.intentScoreLists.size(), pqiq * ((double)limit)));
+        ArrayList<Double> s = new ArrayList<Double>(Collections.nCopies(qai.intentScoreLists.size(), 0.0));
+        ArrayList<Double> q = new ArrayList<Double>(Collections.nCopies(qai.intentScoreLists.size(), 0.0));
+
+        while (result.size() < maxResultDocs && docsToLook.size() > 0) { 
+          int bestIntent = 0;
+          Double bestIntentScore = Double.MIN_VALUE;
+          for (int j = 1; j < qai.intentScoreLists.size(); ++j) {
+            double intentScore = v.get(j) / (2.0 * s.get(j) + 1.0);
+            q.set(j, intentScore);
+            if (intentScore > bestIntentScore) {
+              bestIntent = j; 
+              bestIntentScore = intentScore;
+            }
+          }
+          SortedMap<Double, IndPair> best = new TreeMap<>();
+          for (Integer i : docsToLook) {
+            int docid = qai.queryScoreList.getDocid(i);
+            double cover = lambda * bestIntentScore * qai.getIntentScore(docid, bestIntent); 
+            double otherCoverSum = 0.0;
+            for (int j = 1; j < qai.intentScoreLists.size(); ++j) {
+              if (j != bestIntent) {
+                otherCoverSum +=  q.get(j) * qai.getIntentScore(docid, j); 
+              }
+            }
+            double otherCover = otherCoverSum * (1.0 - lambda);
+            double score = cover + otherCover;
+            best.put(score, new IndPair(docid, i));
+          }
+
+          double bestScore = best.lastKey();
+          int bestDocid = best.get(bestScore).docid;
+          int bestIndex = best.get(bestScore).index;
+          docsToLook.remove(bestIndex);
+          rankedDocs.add(bestDocid);
+          result.add(bestDocid, bestScore);
+
+          double bestDocIntentSum = 0.0;
+          for (int j = 1; j < qai.intentScoreLists.size(); ++j) { 
+            bestDocIntentSum += qai.getIntentScore(bestDocid, j);
+          }
+
+          for (int j = 1; j < qai.intentScoreLists.size(); ++j) { 
+            double prevS = s.get(j);
+            s.set(j, prevS + (qai.getIntentScore(bestDocid, j) / bestDocIntentSum)); 
+          }
+        }
+
+        Double prev = null;
+        for (int i = 0; i < result.size(); i++) {
+          double score = result.getDocidScore(i);
+          if (prev == null) {
+            prev = score;
+          } else if (score >= prev) {
+            result.setDocidScore(i, score * 0.999);
+          }
+        }
+      }
+      // xQuad
+      else {
+        while (result.size() < maxResultDocs && docsToLook.size() > 0) {
+          SortedMap<Double, IndPair> best = new TreeMap<>();
+          // System.out.println("Finding the position: " + (result.size() + 1) + " best doc..."); 
+          for (Integer i : docsToLook) {
+            int docid = qai.queryScoreList.getDocid(i);
+            double relevance = (1.0 - lambda) * qai.getQueryScore(i); 
+            double intentSum = 0.0;
+            for (int j = 1 ; j < qai.intentScoreLists.size(); ++j) {
+              double divScore = pqiq * qai.getIntentScore(docid, j); 
+              if (rankedDocs.size() > 0)  {
+                for (Integer  rankedDocid : rankedDocs) {
+                  divScore *= (1.0 - qai.getIntentScore(rankedDocid, j));  
+                }
+              }
+              intentSum += divScore;
+            } 
+            double diversity = lambda * intentSum;
+            double score = relevance + diversity;
+            best.put(score, new IndPair(docid, i));
+          }
+          double bestScore = best.lastKey();
+          int bestDocid = best.get(bestScore).docid;
+          int bestIndex = best.get(bestScore).index;
+          docsToLook.remove(bestIndex);
+          rankedDocs.add(bestDocid);
+          result.add(bestDocid, bestScore);
+        }
+      }
+      if (trecEvalOutputLen < maxResultDocs) {
+        result.truncate(trecEvalOutputLen); 
+      } 
+      printResults(qai.qid, result, trecEvalOutputPath); 
+    }
   }
 
 
@@ -379,6 +778,7 @@ public class QryEval {
     ArrayList<FeatureVectorFileLine> fileLines = new ArrayList<>();
 
     Map<String, Double> ctfs = new HashMap<String, Double>();
+    
     do {
       line = scan.nextLine();
       String[] items = line.split (":");
@@ -476,7 +876,9 @@ public class QryEval {
       }
      
       for (FeatureVectorFileLine fvfl : fvfls) { 
-        myWriter.write(fvfl.toString(isSVMRank, disabledFeatures));
+        String line2 = fvfl.toString(isSVMRank, disabledFeatures);
+        // System.out.println("LINE: " + line2);
+        myWriter.write(line2);
         fileLines.add(fvfl);
       }
 

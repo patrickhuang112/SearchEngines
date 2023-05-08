@@ -8,7 +8,7 @@ public class FeatureVector {
   public void setFeature(int featureNumber, Double featureScore) {
     featureVector[featureNumber - 1] = featureScore; 
   }
- 
+
   public Double getFeature(int featureNumber) {
     return featureVector[featureNumber - 1]; 
   }
